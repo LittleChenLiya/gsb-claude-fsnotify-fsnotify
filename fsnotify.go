@@ -128,10 +128,30 @@ type Event struct {
 	//   Event{Op: Rename, Name: "/tmp/file"}
 	//   Event{Op: Create, Name: "/tmp/rename", RenamedFrom: "/tmp/file"}
 	renamedFrom string
+
+	// Generation of the watch that was active when this event was accepted;
+	// see the Generation documentation and Watcher.RemoveAndDrain.
+	Generation Generation
 }
 
 // Op describes a set of file operations.
 type Op uint32
+
+// Generation identifies the watch "round" during which an event was accepted.
+//
+// Every successful [Watcher.Add] (that actually creates a watch) allocates a
+// new, strictly increasing generation for the path. Events accepted by the
+// watcher carry the generation of the watch that was active at the time they
+// came in; events for files inside a watched directory carry the directory
+// watch's generation.
+//
+// This makes it possible to tell events from a watch that was removed and
+// immediately re-added apart. See [Watcher.RemoveAndDrain] for waiting until
+// all events of an old generation have been delivered.
+//
+// The zero Generation means fsnotify could not attribute the event to a watch
+// (for example a synthetic event).
+type Generation uint64
 
 // The operations fsnotify can trigger; see the documentation on [Watcher] for a
 // full description, and check them with [Event.Has].
@@ -304,6 +324,31 @@ func (w *Watcher) AddWith(path string, opts ...addOpt) error { return w.b.AddWit
 // Returns nil if [Watcher.Close] was called.
 func (w *Watcher) Remove(path string) error { return w.b.Remove(path) }
 
+// RemoveAndDrain is like [Watcher.Remove], but also reports when all events
+// the watcher had already accepted for the old watch have been delivered on
+// the [Watcher.Events] channel.
+//
+// It allocates no new generation; a subsequent successful [Watcher.Add] for
+// the same path starts a new generation whose events can never be confused
+// with the old ones.
+//
+// The returned Generation is the retired generation: events with that
+// Generation are the last events belonging to the old watch. The returned
+// channel is closed once all such events have been handed to the consumer.
+//
+// Removing a path that has not been added returns [ErrNonExistentWatch] and a
+// channel that is already closed. Calling RemoveAndDrain again while the
+// previous drain is still pending returns the same Generation and channel.
+//
+// If [Watcher.Close] is called while a drain is pending the channel is closed
+// immediately, so waiting on it can never deadlock.
+//
+// Returns a zero Generation and an already-closed channel (and no error) if
+// [Watcher.Close] was already called.
+func (w *Watcher) RemoveAndDrain(path string) (Generation, <-chan struct{}, error) {
+	return w.b.RemoveAndDrain(path)
+}
+
 // Close removes all watches and closes the Events channel.
 func (w *Watcher) Close() error { return w.b.Close() }
 
@@ -374,6 +419,7 @@ type (
 		Add(string) error
 		AddWith(string, ...addOpt) error
 		Remove(string) error
+		RemoveAndDrain(string) (Generation, <-chan struct{}, error)
 		WatchList() []string
 		Close() error
 		xSupports(Op) bool

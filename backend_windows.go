@@ -22,16 +22,18 @@ import (
 )
 
 type readDirChangesW struct {
+	*shared
 	Events chan Event
 	Errors chan error
 
 	port  windows.Handle // Handle to completion port
 	input chan *input    // Inputs to the reader are sent on this channel
-	done  chan chan<- error
+
+	// Closed by readEvents after the port and all watches are torn down.
+	doneResp chan error
 
 	mu      sync.Mutex // Protects access to watches, closed
 	watches watchMap   // Map of watches (key: i-number)
-	closed  bool       // Set to true when Close() is first called
 }
 
 var defaultBufferSize = 50
@@ -42,67 +44,36 @@ func newBackend(ev chan Event, errs chan error) (backend, error) {
 		return nil, os.NewSyscallError("CreateIoCompletionPort", err)
 	}
 	w := &readDirChangesW{
-		Events:  ev,
-		Errors:  errs,
-		port:    port,
-		watches: make(watchMap),
-		input:   make(chan *input, 1),
-		done:    make(chan chan<- error, 1),
+		shared:   newShared(ev, errs),
+		Events:   ev,
+		Errors:   errs,
+		port:     port,
+		watches:  make(watchMap),
+		input:    make(chan *input, 1),
+		doneResp: make(chan error, 1),
 	}
 	go w.readEvents()
 	return w, nil
 }
 
-func (w *readDirChangesW) isClosed() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.closed
-}
-
 func (w *readDirChangesW) sendEvent(name, renamedFrom string, mask uint64) bool {
 	if mask == 0 {
-		return false
+		return true
 	}
 
 	event := w.newEvent(name, uint32(mask))
 	event.renamedFrom = renamedFrom
-	select {
-	case ch := <-w.done:
-		w.done <- ch
-	case w.Events <- event:
-	}
-	return true
-}
-
-// Returns true if the error was sent, or false if watcher is closed.
-func (w *readDirChangesW) sendError(err error) bool {
-	if err == nil {
-		return true
-	}
-	select {
-	case <-w.done:
-		return false
-	case w.Errors <- err:
-		return true
-	}
+	return w.shared.sendEvent(event)
 }
 
 func (w *readDirChangesW) Close() error {
-	if w.isClosed() {
+	if w.shared.close() {
 		return nil
 	}
-
-	w.mu.Lock()
-	w.closed = true
-	w.mu.Unlock()
-
-	// Send "done" message to the reader goroutine
-	ch := make(chan error)
-	w.done <- ch
 	if err := w.wakeupReader(); err != nil {
 		return err
 	}
-	return <-ch
+	return <-w.doneResp
 }
 
 func (w *readDirChangesW) Add(name string) error { return w.AddWith(name) }
@@ -222,6 +193,7 @@ func (w *readDirChangesW) newEvent(name string, mask uint32) Event {
 const (
 	opAddWatch = iota
 	opRemoveWatch
+	opDrainWatch
 )
 
 const (
@@ -234,6 +206,10 @@ type input struct {
 	flags   uint32
 	bufsize int
 	reply   chan error
+
+	// opDrainWatch results.
+	gen  Generation
+	done <-chan struct{}
 }
 
 type inode struct {
@@ -323,18 +299,19 @@ func (m watchMap) set(ino *inode, watch *watch) {
 }
 
 // Must run within the I/O thread.
-func (w *readDirChangesW) addWatch(pathname string, flags uint64, bufsize int) error {
+func (w *readDirChangesW) addWatch(pathname string, flags uint64, bufsize int) (bool, error) {
 	pathname, recurse := recursivePath(pathname)
 
 	dir, err := w.getDir(pathname)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	ino, err := w.getIno(dir)
 	if err != nil {
-		return err
+		return false, err
 	}
+	created := false
 	w.mu.Lock()
 	watchEntry := w.watches.get(ino)
 	w.mu.Unlock()
@@ -342,7 +319,7 @@ func (w *readDirChangesW) addWatch(pathname string, flags uint64, bufsize int) e
 		_, err := windows.CreateIoCompletionPort(ino.handle, w.port, 0, 0)
 		if err != nil {
 			windows.CloseHandle(ino.handle)
-			return os.NewSyscallError("CreateIoCompletionPort", err)
+			return false, os.NewSyscallError("CreateIoCompletionPort", err)
 		}
 		watchEntry = &watch{
 			ino:     ino,
@@ -360,15 +337,21 @@ func (w *readDirChangesW) addWatch(pathname string, flags uint64, bufsize int) e
 	}
 	w.mu.Lock()
 	if pathname == dir {
+		if watchEntry.mask&^provisional == 0 {
+			created = true
+		}
 		watchEntry.mask |= flags
 	} else {
+		if watchEntry.names[filepath.Base(pathname)]&^provisional == 0 {
+			created = true
+		}
 		watchEntry.names[filepath.Base(pathname)] |= flags
 	}
 	w.mu.Unlock()
 
 	err = w.startRead(watchEntry)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	w.mu.Lock()
@@ -378,7 +361,10 @@ func (w *readDirChangesW) addWatch(pathname string, flags uint64, bufsize int) e
 		watchEntry.names[filepath.Base(pathname)] &= ^provisional
 	}
 	w.mu.Unlock()
-	return nil
+	if created {
+		w.shared.added(pathname)
+	}
+	return created, nil
 }
 
 // Must run within the I/O thread.
@@ -426,7 +412,56 @@ func (w *readDirChangesW) remWatch(pathname string) error {
 		w.sendEvent(filepath.Join(watch.path, name), "", mask&sysFSIGNORED)
 	}
 
-	return w.startRead(watch)
+	if err := w.startRead(watch); err != nil {
+		return err
+	}
+	w.shared.removed(pathname)
+	return nil
+}
+
+// drainWatch is the I/O-thread half of RemoveAndDrain: it retires the
+// generation for the path before remWatch tears the watch down, so events read
+// from an already-completed I/O packet can still be attributed to the old
+// generation.
+// Must run within the I/O thread.
+func (w *readDirChangesW) drainWatch(pathname string) (Generation, <-chan struct{}, error) {
+	clean := filepath.Clean(pathname)
+	gen, done := w.shared.beginDrain(clean)
+	err := w.remWatch(pathname)
+	if err != nil {
+		// The watch doesn't exist: no generation was retired. complete the
+		// (already-closed) signal so the caller isn't waiting on it.
+		c := make(chan struct{})
+		close(c)
+		return 0, c, err
+	}
+	return gen, done, nil
+}
+
+// RemoveAndDrain removes the watch and retires its generation, returning a
+// signal that completes once all already-accepted events are delivered.
+func (w *readDirChangesW) RemoveAndDrain(name string) (Generation, <-chan struct{}, error) {
+	if w.isClosed() {
+		return 0, closedChan(), nil
+	}
+	in := &input{
+		op:    opDrainWatch,
+		path:  name,
+		reply: make(chan error),
+	}
+	w.input <- in
+	if err := w.wakeupReader(); err != nil {
+		return 0, closedChan(), err
+	}
+	select {
+	case err := <-in.reply:
+		if err != nil {
+			return 0, closedChan(), err
+		}
+		return in.gen, in.done, nil
+	case <-w.shared.closed:
+		return 0, closedChan(), nil
+	}
 }
 
 // Must run within the I/O thread.
@@ -509,7 +544,7 @@ func (w *readDirChangesW) readEvents() {
 		watch := (*watch)(unsafe.Pointer(ov))
 		if watch == nil {
 			select {
-			case ch := <-w.done:
+			case <-w.shared.closed:
 				w.mu.Lock()
 				var indexes []indexMap
 				for _, index := range w.watches {
@@ -527,18 +562,24 @@ func (w *readDirChangesW) readEvents() {
 				if err != nil {
 					err = os.NewSyscallError("CloseHandle", err)
 				}
+				w.waitDispatch()
 				close(w.Events)
 				close(w.Errors)
-				ch <- err
+				w.doneResp <- err
 				return
 			case in := <-w.input:
 				switch in.op {
 				case opAddWatch:
-					in.reply <- w.addWatch(in.path, uint64(in.flags), in.bufsize)
+					_, err := w.addWatch(in.path, uint64(in.flags), in.bufsize)
+					in.reply <- err
 				case opRemoveWatch:
 					in.reply <- w.remWatch(in.path)
+				case opDrainWatch:
+					gen, done, err := w.drainWatch(in.path)
+					in.gen = gen
+					in.done = done
+					in.reply <- err
 				}
-			default:
 			}
 			continue
 		}

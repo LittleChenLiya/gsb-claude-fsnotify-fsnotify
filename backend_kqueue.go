@@ -267,11 +267,15 @@ func (w *kqueue) AddWith(name string, opts ...addOpt) error {
 		return fmt.Errorf("%w: %s", xErrUnsupported, with.op)
 	}
 
+	_, already := w.watches.byPath(filepath.Clean(name))
 	_, err := w.addWatch(name, noteAllEvents, false)
 	if err != nil {
 		return err
 	}
 	w.watches.addUserWatch(name)
+	if !already {
+		w.shared.added(name)
+	}
 	return nil
 }
 
@@ -281,6 +285,17 @@ func (w *kqueue) Remove(name string) error {
 			time.Now().Format("15:04:05.000000000"), name)
 	}
 	return w.remove(name, true)
+}
+
+// RemoveAndDrain removes the watch and retires its generation, returning a
+// signal that completes once all already-accepted events are delivered.
+func (w *kqueue) RemoveAndDrain(name string) (Generation, <-chan struct{}, error) {
+	clean := filepath.Clean(name)
+	gen, done := w.shared.beginDrain(clean)
+	if err := w.Remove(name); err != nil {
+		return 0, closedChan(), err
+	}
+	return gen, done, nil
 }
 
 func (w *kqueue) remove(name string, unwatchFiles bool) error {
@@ -315,6 +330,9 @@ func (w *kqueue) remove2(name string, unwatchFiles bool) error {
 			// path they did not explicitly watch themselves.
 			w.remove2(name, false)
 		}
+	}
+	if unwatchFiles {
+		w.shared.removed(name)
 	}
 	return nil
 }

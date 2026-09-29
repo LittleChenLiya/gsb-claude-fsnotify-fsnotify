@@ -29,6 +29,7 @@ type inotify struct {
 	inotifyFile *os.File
 	watches     *watches
 	doneResp    chan struct{} // Channel to respond to Close
+	mu          sync.Mutex    // Protects watches.
 
 	// Store rename cookies in an array, with the index wrapping to 0. Almost
 	// all of the time what we get is a MOVED_FROM to set the cookie and the
@@ -225,7 +226,15 @@ func (w *inotify) AddWith(path string, opts ...addOpt) error {
 		if with.op.Has(xUnportableCloseRead) {
 			flags |= unix.IN_CLOSE_NOWRITE
 		}
-		return w.register(path, flags, wf)
+		_, existed := w.watches.path[path]
+		if err := w.register(path, flags, wf); err != nil {
+			return err
+		}
+		// A repeated Add is a no-op and must not allocate a new generation.
+		if wf&flagByUser != 0 && !existed {
+			w.shared.added(path)
+		}
+		return nil
 	}
 
 	w.mu.Lock()
@@ -261,7 +270,7 @@ func (w *inotify) AddWith(path string, opts ...addOpt) error {
 		})
 	}
 
-	return add(path, with, 0)
+	return add(path, with, flagByUser)
 }
 
 func (w *inotify) register(path string, flags uint32, wf watchFlag) error {
@@ -304,8 +313,13 @@ func (w *inotify) Remove(name string) error {
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.remove(filepath.Clean(name))
+	clean := filepath.Clean(name)
+	err := w.remove(clean)
+	w.mu.Unlock()
+	if err == nil {
+		w.shared.removed(clean)
+	}
+	return err
 }
 
 func (w *inotify) remove(name string) error {
@@ -334,6 +348,17 @@ func (w *inotify) remove(name string) error {
 	return nil
 }
 
+// RemoveAndDrain removes the watch and retires its generation, returning a
+// signal that completes once all already-accepted events are delivered.
+func (w *inotify) RemoveAndDrain(name string) (Generation, <-chan struct{}, error) {
+	clean := filepath.Clean(name)
+	gen, done := w.shared.beginDrain(clean)
+	if err := w.Remove(name); err != nil {
+		return 0, closedChan(), err
+	}
+	return gen, done, nil
+}
+
 func (w *inotify) WatchList() []string {
 	if w.isClosed() {
 		return nil
@@ -352,9 +377,10 @@ func (w *inotify) WatchList() []string {
 // received events into Event objects and sends them via the Events channel
 func (w *inotify) readEvents() {
 	defer func() {
-		close(w.doneResp)
+		w.waitDispatch()
 		close(w.Errors)
 		close(w.Events)
+		close(w.doneResp)
 	}()
 
 	var buf [unix.SizeofInotifyEvent * 4096]byte // Buffer for a maximum of 4096 raw events

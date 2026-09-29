@@ -1,5 +1,16 @@
 # Changelog
 
+Unreleased
+----------
+
+### New features
+
+- Add `Watcher.RemoveAndDrain`: remove a watch and get a generation number and
+  a channel that closes once every event the watcher had already accepted for
+  the old watch has been delivered. Events now carry an `Event.Generation` so
+  callers can tell events from a watch that was removed and immediately
+  re-added apart.
+
 1.10.1 2026-05-04
 -----------------
 

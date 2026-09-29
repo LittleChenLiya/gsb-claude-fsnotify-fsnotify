@@ -89,8 +89,12 @@ func (w *fen) AddWith(name string, opts ...addOpt) error {
 		}
 
 		w.mu.Lock()
+		_, existed := w.dirs[name]
 		w.dirs[name] = with.op
 		w.mu.Unlock()
+		if !existed {
+			w.shared.added(name)
+		}
 		return nil
 	}
 
@@ -100,9 +104,24 @@ func (w *fen) AddWith(name string, opts ...addOpt) error {
 	}
 
 	w.mu.Lock()
+	_, existed := w.watches[name]
 	w.watches[name] = with.op
 	w.mu.Unlock()
+	if !existed {
+		w.shared.added(name)
+	}
 	return nil
+}
+
+// RemoveAndDrain removes the watch and retires its generation, returning a
+// signal that completes once all already-accepted events are delivered.
+func (w *fen) RemoveAndDrain(name string) (Generation, <-chan struct{}, error) {
+	clean := filepath.Clean(name)
+	gen, done := w.shared.beginDrain(clean)
+	if err := w.Remove(name); err != nil {
+		return 0, closedChan(), err
+	}
+	return gen, done, nil
 }
 
 func (w *fen) Remove(name string) error {
@@ -136,6 +155,7 @@ func (w *fen) Remove(name string) error {
 		if err != nil {
 			return err
 		}
+		w.shared.removed(filepath.Clean(name))
 		return nil
 	}
 
@@ -143,6 +163,7 @@ func (w *fen) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+	w.shared.removed(filepath.Clean(name))
 
 	return nil
 }
@@ -152,6 +173,7 @@ func (w *fen) readEvents() {
 	// If this function returns, the watcher has been closed and we can close
 	// these channels
 	defer func() {
+		w.waitDispatch()
 		close(w.Errors)
 		close(w.Events)
 	}()
