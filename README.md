@@ -83,6 +83,11 @@ run with:
 
     % go run ./cmd/fsnotify
 
+To share one Watcher between multiple independent consumers – each with its
+own channels, bounded buffer, and Close, with native watches reference
+counted across scopes – see the WatchScope layer in [WATCHSCOPE.md](WATCHSCOPE.md)
+and the demo in [cmd/watchscope-demo](cmd/watchscope-demo).
+
 Further detailed documentation can be found in godoc:
 https://pkg.go.dev/github.com/fsnotify/fsnotify
 
