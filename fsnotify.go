@@ -314,6 +314,19 @@ func (w *Watcher) Close() error { return w.b.Close() }
 // [Watcher.Close] was called.
 func (w *Watcher) WatchList() []string { return w.b.WatchList() }
 
+// Identity derives the explicit path identity of an event path against the
+// watch roots currently registered on this watcher.
+//
+// The watch list is snapshotted and the path is classified purely lexically:
+// the watcher's state and the filesystem are left untouched, symlinks are
+// not followed, and a path that has already been deleted is normalized just
+// the same. Event.Name is only read; the event passed in is not modified.
+// See [PathIndex] and [PathIdentity] for details; reuse a [PathIndex] built
+// with [NewPathIndexFromWatcher] when classifying many events at once.
+func (w *Watcher) Identity(eventPath string) (PathIdentity, error) {
+	return NewPathIndexFromWatcher(w).Identity(eventPath)
+}
+
 // Supports reports if all the listed operations are supported by this platform.
 //
 // Create, Write, Remove, Rename, and Chmod are always supported. It can only
