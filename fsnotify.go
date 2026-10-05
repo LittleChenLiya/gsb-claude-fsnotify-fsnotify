@@ -128,6 +128,11 @@ type Event struct {
 	//   Event{Op: Rename, Name: "/tmp/file"}
 	//   Event{Op: Create, Name: "/tmp/rename", RenamedFrom: "/tmp/file"}
 	renamedFrom string
+
+	// identity is the normalized path identity for this event. It is set by the
+	// path identity layer and is used for internal identity comparison. The
+	// display path (Name) is never overwritten.
+	identity pathIdentity
 }
 
 // Op describes a set of file operations.
