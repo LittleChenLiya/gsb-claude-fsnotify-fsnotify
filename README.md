@@ -86,6 +86,34 @@ run with:
 Further detailed documentation can be found in godoc:
 https://pkg.go.dev/github.com/fsnotify/fsnotify
 
+Consumer cursors
+----------------
+A `Hub` fans the events of one `Watcher` out to any number of consumers, each
+with its own cursor. Every event gets a monotonically increasing sequence
+number and is kept in a bounded buffer until *all* active consumers have
+confirmed it with `Ack`, so a fast consumer can never release events a slower
+consumer still needs. A confirmation can only move forward and only up to the
+position actually delivered; anything else is rejected with `ErrIllegalAck`.
+
+When the bounded buffer overflows, only the consumers that fell behind get an
+explicit `ErrGap` from `Cursor.Next` and restart at the oldest retained
+event — data is never dropped silently. Closing a cursor releases its hold on
+the buffer, and closing the Hub (or the underlying Watcher) wakes all blocked
+consumers with `ErrClosed`. All cursor state lives in the Hub; the `Watcher`
+and its OS watch loop are untouched.
+
+```go
+hub := fsnotify.NewHub(watcher, 1024)
+c := hub.ConsumerFromStart()
+for {
+    seq, e, err := c.Next()
+    if errors.Is(err, fsnotify.ErrGap)    { /* re-sync */ }
+    if errors.Is(err, fsnotify.ErrClosed) { return }
+    process(e)
+    c.Ack(seq)
+}
+```
+
 FAQ
 ---
 ### Will a file still be watched when it's moved to another directory?
